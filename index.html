@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>地図共有プロトタイプ（国土地理院 × Supabase）</title>
+
+  <!-- Leaflet.js のCSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: sans-serif;
+    }
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+    /* 上部の操作バー */
+    .control-bar {
+      position: absolute;
+      top: 10px;
+      left: 50px;
+      z-index: 1000;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 10px 14px;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 13px;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn-secondary { background: #4b5563; }
+    .btn-secondary:hover { background: #374151; }
+
+    /* 入力用モーダル */
+    #modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 2000;
+      justify-content: center;
+      align-items: center;
+    }
+    .modal-box {
+      background: white;
+      padding: 20px;
+      border-radius: 10px;
+      width: 90%;
+      max-width: 340px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+    }
+    .modal-box h3 { margin-top: 0; font-size: 16px; }
+    .modal-box label { display: block; font-size: 13px; margin-top: 10px; font-weight: bold; }
+    .modal-box input, .modal-box textarea {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      margin-top: 4px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    .modal-actions {
+      margin-top: 16px;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 上部操作パネル -->
+  <div class="control-bar">
+    <button class="btn" onclick="pinCurrentLocation()">📍 現在地を送信</button>
+    <button class="btn btn-secondary" onclick="loadPins()">🔄 最新に更新</button>
+    <span style="font-size: 12px; color: #555;">※地図タップでもピン登録可</span>
+  </div>
+
+  <!-- 地図表示エリア -->
+  <div id="map"></div>
+
+  <!-- 投稿フォーム（モーダル） -->
+  <div id="modal">
+    <div class="modal-box">
+      <h3>この地点の情報を登録</h3>
+      <div id="coord-preview" style="font-size: 11px; color: #666;"></div>
+
+      <label>班名・ニックネーム（必須）</label>
+      <input type="text" id="input-group" placeholder="例：1組3班" maxlength="20" />
+
+      <label>状況・メモ</label>
+      <textarea id="input-comment" rows="3" placeholder="例：予定通り到着しました！" maxlength="100"></textarea>
+
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeModal()">キャンセル</button>
+        <button class="btn" id="submit-btn" onclick="submitPin()">登録する</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Leaflet.js と Supabase JS SDK -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <script>
+    // ==========================================
+    // 1. Supabase 接続設定（ここを書き換えてください）
+    // ==========================================
+    const SUPABASE_URL = "YOUR_SUPABASE_URL";
+    const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
+    const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    // ==========================================
+    // 2. 地図の初期化（国土地理院タイル）
+    // ==========================================
+    // 初期表示は東京駅付近（必要に応じて変更）
+    const map = L.map("map").setView([35.681236, 139.767125], 14);
+
+    // 標準地図タイル
+    const gsiStd = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", {
+      attribution: "<a href='https://maps.gsi.go.jp/development/ichiran.html' target='_blank'>国土地理院</a>",
+      maxZoom: 18
+    });
+
+    // 航空写真タイル（切り替え用）
+    const gsiPhoto = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg", {
+      attribution: "<a href='https://maps.gsi.go.jp/development/ichiran.html' target='_blank'>国土地理院</a>",
+      maxZoom: 18
+    });
+
+    gsiStd.addTo(map);
+    L.control.layers({ "標準地図": gsiStd, "航空写真": gsiPhoto }).addTo(map);
+
+    // ピンをまとめて管理するレイヤーグループ
+    const markersLayer = L.layerGroup().addTo(map);
+
+    let selectedLat = null;
+    let selectedLng = null;
+
+    // ==========================================
+    // 3. 地図タップ・現在地取得のイベント
+    // ==========================================
+    map.on("click", function (e) {
+      openModal(e.latlng.lat, e.latlng.lng);
+    });
+
+    function pinCurrentLocation() {
+      if (!navigator.geolocation) {
+        alert("お使いのブラウザはGPS位置情報に対応していません。");
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          map.setView([lat, lng], 16);
+          openModal(lat, lng);
+        },
+        (err) => {
+          alert("現在地を取得できませんでした。位置情報の許可設定を確認してください。");
+          console.error(err);
+        },
+        { enableHighAccuracy: true }
+      );
+    }
+
+    function openModal(lat, lng) {
+      selectedLat = lat;
+      selectedLng = lng;
+      document.getElementById("coord-preview").textContent =
+        `緯度: ${lat.toFixed(5)} / 経度: ${lng.toFixed(5)}`;
+      document.getElementById("modal").style.display = "flex";
+    }
+
+    function closeModal() {
+      document.getElementById("modal").style.display = "none";
+      document.getElementById("input-comment").value = "";
+    }
+
+    // ==========================================
+    // 4. Supabase への保存・読み込み処理
+    // ==========================================
+    async function submitPin() {
+      const groupName = document.getElementById("input-group").value.trim();
+      const comment = document.getElementById("input-comment").value.trim();
+
+      if (!groupName) {
+        alert("班名・ニックネームを入力してください。");
+        return;
+      }
+
+      const btn = document.getElementById("submit-btn");
+      btn.disabled = true;
+      btn.textContent = "送信中...";
+
+      const { error } = await supabaseClient
+        .from("map_pins")
+        .insert([{
+          group_name: groupName,
+          comment: comment,
+          lat: selectedLat,
+          lng: selectedLng
+        }]);
+
+      btn.disabled = false;
+      btn.textContent = "登録する";
+
+      if (error) {
+        alert("保存に失敗しました: " + error.message);
+        console.error(error);
+        return;
+      }
+
+      closeModal();
+      await loadPins(); // 登録後すぐに地図を再読み込み
+    }
+
+    async function loadPins() {
+      const { data, error } = await supabaseClient
+        .from("map_pins")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("読み込みエラー:", error);
+        return;
+      }
+
+      // 既存のピンを一度クリアして再描画
+      markersLayer.clearLayers();
+
+      data.forEach((pin) => {
+        const timeStr = new Date(pin.created_at).toLocaleTimeString("ja-JP", {
+          hour: "2-digit",
+          minute: "2-digit"
+        });
+
+        // XSS対策のためDOM要素でポップアップ中身を作成
+        const popupDiv = document.createElement("div");
+        const titleEl = document.createElement("strong");
+        titleEl.textContent = `${pin.group_name}（${timeStr}）`;
+        popupDiv.appendChild(titleEl);
+
+        if (pin.comment) {
+          const br = document.createElement("br");
+          const commentEl = document.createElement("span");
+          commentEl.textContent = pin.comment;
+          popupDiv.appendChild(br);
+          popupDiv.appendChild(commentEl);
+        }
+
+        L.marker([pin.lat, pin.lng])
+          .bindPopup(popupDiv)
+          .addTo(markersLayer);
+      });
+    }
+
+    // ページ読み込み時に既存のピンを表示
+    loadPins();
+  </script>
+</body>
+</html>
